@@ -6,7 +6,8 @@ User provides:
   --assignments  which read files belong to which target/clone/primer
   --reads-dir    folder with .seq files
 
-Any number of primers/reactions per clone are UNION-ed over the target bases.
+Base correctness: UNION over primers at each reference position.
+Insertions: independent reference-boundary events (see insertion.py).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import csv
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 from Bio.Seq import Seq
 
@@ -24,8 +25,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from Bio import pairwise2  # noqa: E402
 
 from common import (
-    Assignment,
-    Target,
     group_key,
     index_assignments,
     load_assignments,
@@ -33,6 +32,20 @@ from common import (
     resolve_read_path,
     validate_assignments,
 )
+from insertion import (
+    STATUS_CANDIDATE,
+    STATUS_CONFLICT,
+    STATUS_NO_INSERT,
+    STATUS_STRONG,
+    InsertionCandidate,
+    NoInsertSpan,
+    candidates_from_alignment,
+    merge_clone_insertions,
+    no_insert_spans_from_alignment,
+)
+
+
+WORTH_STATUSES = {"PASS", "PASS_INSERT_REVIEW"}
 
 
 def read_seq_file(p: Path) -> str:
@@ -43,32 +56,15 @@ def read_seq_file(p: Path) -> str:
     return "".join(x for x in lines if x and not x.startswith(">"))
 
 
-def count_internal_inserts(ref_aln: str, query_aln: str, ref_len: int) -> int:
-    ref_pos = 0
-    inserts = 0
-    for rc, qc in zip(ref_aln, query_aln):
-        if rc == "-" and qc != "-" and 0 < ref_pos < ref_len:
-            inserts += 1
-        if rc != "-":
-            ref_pos += 1
-    return inserts
-
-
-def trusted_internal_inserts(inserts: int, match_bp: int, ref_len: int, identity: float) -> int:
-    if ref_len <= 0 or inserts <= 0:
-        return 0
-    if match_bp >= int(0.90 * ref_len) and identity >= 0.95:
-        return inserts
-    return 0
-
-
-def align_calls(read_seq: str, ref_seq: str) -> Tuple[Dict[int, str], float, int, str, int]:
-    def one(q: str) -> Tuple[Dict[int, str], float, int, int]:
+def align_calls(
+    read_seq: str, ref_seq: str, primer: str = ""
+) -> Tuple[Dict[int, str], float, int, str, List[InsertionCandidate], List[NoInsertSpan]]:
+    def one(q: str) -> Tuple[Dict[int, str], float, int, List[InsertionCandidate], List[NoInsertSpan]]:
         aln = pairwise2.align.localms(
             ref_seq, q, 2.0, -1.0, -7.0, -1.0, one_alignment_only=True
         )
         if not aln:
-            return {}, 0.0, 0, 0
+            return {}, 0.0, 0, [], []
         a = aln[0]
         calls: Dict[int, str] = {}
         ref_pos = 0
@@ -82,24 +78,24 @@ def align_calls(read_seq: str, ref_seq: str) -> Tuple[Dict[int, str], float, int
             if rc != "-":
                 ref_pos += 1
         ident = (match / aligned) if aligned else 0.0
-        raw_ins = count_internal_inserts(a.seqA, a.seqB, len(ref_seq))
-        inserts = trusted_internal_inserts(raw_ins, match, len(ref_seq), ident)
-        return calls, ident, aligned, inserts
+        cands = candidates_from_alignment(ref_seq, a.seqA, a.seqB, len(q), primer=primer)
+        spans = no_insert_spans_from_alignment(a.seqA, a.seqB, primer=primer)
+        return calls, ident, aligned, cands, spans
 
-    c1, i1, a1, n1 = one(read_seq)
-    c2, i2, a2, n2 = one(str(Seq(read_seq).reverse_complement()))
+    c1, i1, a1, n1, s1 = one(read_seq)
+    c2, i2, a2, n2, s2 = one(str(Seq(read_seq).reverse_complement()))
     m1 = sum(1 for pos, b in c1.items() if b == ref_seq[pos])
     m2 = sum(1 for pos, b in c2.items() if b == ref_seq[pos])
-    if (m2, -n2, a2, i2) > (m1, -n1, a1, i1):
-        return c2, i2, a2, "RC_of_read", n2
-    return c1, i1, a1, "as_is", n1
+    # Prefer orientation with more correct bases; then fewer HC inserts (cleaner)
+    hc1 = sum(1 for c in n1 if c.high_confidence)
+    hc2 = sum(1 for c in n2 if c.high_confidence)
+    if (m2, -hc2, a2, i2) > (m1, -hc1, a1, i1):
+        return c2, i2, a2, "RC_of_read", n2, s2
+    return c1, i1, a1, "as_is", n1, s1
 
 
-def evaluate_union(
-    ref_seq: str,
-    primer_calls: Dict[str, Dict[int, str]],
-    primer_inserts: Dict[str, int],
-) -> dict:
+def evaluate_base_union(ref_seq: str, primer_calls: Dict[str, Dict[int, str]]) -> dict:
+    """Reference-position union only — insertions handled separately."""
     ref_len = len(ref_seq)
     pos_bases: Dict[int, Set[str]] = defaultdict(set)
     covered: Set[int] = set()
@@ -116,7 +112,6 @@ def evaluate_union(
         elif bases:
             mismatch_only += 1
 
-    insert_bp = int(sum(primer_inserts.values()))
     return {
         "ref_len": ref_len,
         "success_bp": success,
@@ -124,12 +119,19 @@ def evaluate_union(
         "covered_bp": len(covered),
         "uncovered_bp": ref_len - len(covered),
         "mismatch_only_bp": mismatch_only,
-        "internal_insert_bp": insert_bp,
         "success_ratio": round(success / ref_len, 4) if ref_len else 0.0,
         "coverage_ratio": round(len(covered) / ref_len, 4) if ref_len else 0.0,
         "n_reads_used": len(primer_calls),
-        "perfect": success == ref_len and insert_bp == 0,
+        "bases_perfect": success == ref_len,
     }
+
+
+def stage1_status(bases_perfect: bool, insert_status: str) -> str:
+    if not bases_perfect:
+        return "FAIL"
+    if insert_status == STATUS_NO_INSERT:
+        return "PASS"
+    return "PASS_INSERT_REVIEW"
 
 
 def write_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
@@ -158,7 +160,6 @@ def main() -> None:
     file_to_meta: Dict[str, dict] = {}
     missing: List[str] = []
 
-    # Prefer assignment rows that point at seq files; also accept ab1 names and switch ext.
     seen_paths: Set[Path] = set()
     for asg in assignments:
         path = resolve_read_path(args.reads_dir, asg.file, ".seq")
@@ -169,17 +170,17 @@ def main() -> None:
             continue
         seen_paths.add(path)
 
-        # Re-resolve assignment by actual basename if needed
         asg_use = asg_by_file.get(path.name) or asg_by_file.get(Path(asg.file).name) or asg
         if asg_use.target_id not in targets:
             continue
         ref = targets[asg_use.target_id]
         seq = read_seq_file(path)
-        calls, ident, aln_len, ori, inserts = align_calls(seq, ref.sequence)
+        primer = asg_use.primer
+        calls, ident, aln_len, ori, cands, spans = align_calls(seq, ref.sequence, primer=primer)
         match_n = sum(1 for pos, b in calls.items() if b == ref.sequence[pos])
         mism_n = len(calls) - match_n
+        hc_bp = sum(c.insert_len for c in cands if c.high_confidence)
         key = group_key(asg_use.target_id, asg_use.clone_id)
-        primer = asg_use.primer
 
         slot = by_clone.setdefault(
             key,
@@ -189,14 +190,16 @@ def main() -> None:
                 "ref_seq": ref.sequence,
                 "primer_calls": {},
                 "primer_files": {},
-                "primer_inserts": {},
+                "primer_candidates": {},
+                "primer_no_insert": {},
             },
         )
         prev = slot["primer_calls"].get(primer)
         if prev is None or len(calls) > len(prev):
             slot["primer_calls"][primer] = calls
             slot["primer_files"][primer] = path.name
-            slot["primer_inserts"][primer] = inserts
+            slot["primer_candidates"][primer] = cands
+            slot["primer_no_insert"][primer] = spans
 
         meta = {
             "file": path.name,
@@ -208,7 +211,11 @@ def main() -> None:
             "identity": round(ident, 4),
             "match_bp": match_n,
             "mismatch_bp": mism_n,
-            "internal_insert_bp": inserts,
+            "internal_insert_bp": hc_bp,
+            "insert_status": ",".join(
+                sorted({STATUS_CANDIDATE for c in cands if c.high_confidence}) or [STATUS_NO_INSERT]
+            ),
+            "insert_evidence": ";".join(c.summary() for c in cands if c.high_confidence),
             "read_len": len(seq),
         }
         per_read.append(meta)
@@ -217,8 +224,9 @@ def main() -> None:
     clone_rows: List[dict] = []
     clone_status: Dict[str, str] = {}
     for key, slot in sorted(by_clone.items()):
-        stats = evaluate_union(slot["ref_seq"], slot["primer_calls"], slot["primer_inserts"])
-        status = "PASS" if stats["perfect"] else "FAIL"
+        base = evaluate_base_union(slot["ref_seq"], slot["primer_calls"])
+        ins = merge_clone_insertions(slot["primer_candidates"], slot["primer_no_insert"])
+        status = stage1_status(base["bases_perfect"], ins.status)
         clone_status[key] = status
         primers = sorted(slot["primer_files"])
         clone_rows.append(
@@ -227,7 +235,11 @@ def main() -> None:
                 "clone_id": slot["clone_id"],
                 "primers": "|".join(primers),
                 "files": "|".join(slot["primer_files"][p] for p in primers),
-                **stats,
+                **base,
+                "internal_insert_bp": ins.internal_insert_bp,
+                "insert_status": ins.status,
+                "insert_evidence": ins.evidence,
+                "perfect": base["bases_perfect"] and ins.status == STATUS_NO_INSERT,
                 "stage1_status": status,
             }
         )
@@ -259,25 +271,28 @@ def main() -> None:
                     "match_bp": meta["match_bp"],
                     "mismatch_bp": meta["mismatch_bp"],
                     "internal_insert_bp": meta["internal_insert_bp"],
+                    "insert_status": meta["insert_status"],
+                    "insert_evidence": meta["insert_evidence"],
                     "read_len": meta["read_len"],
                 }
             )
         gene_clones = [r for r in clone_rows if r["target_id"] == tid]
         n_pass = sum(1 for r in gene_clones if r["stage1_status"] == "PASS")
+        n_review = sum(1 for r in gene_clones if r["stage1_status"] == "PASS_INSERT_REVIEW")
         row["n_clones"] = len(gene_clones)
         row["n_pass_clones"] = n_pass
-        row["target_not_failed"] = "YES" if n_pass > 0 else "NO"
+        row["target_not_failed"] = "YES" if (n_pass + n_review) > 0 else "NO"
         matrix_rows.append(row)
 
-    pass_keys = {
+    worth_keys = {
         group_key(r["target_id"], r["clone_id"])
         for r in clone_rows
-        if r["stage1_status"] == "PASS"
+        if r["stage1_status"] in WORTH_STATUSES
     }
     files_worth = []
     for meta in per_read:
         key = group_key(meta["target_id"], meta["clone_id"])
-        if key not in pass_keys:
+        if key not in worth_keys:
             continue
         stem = Path(meta["file"]).stem
         ab1_name = stem + ".ab1"
@@ -290,7 +305,7 @@ def main() -> None:
                 "clone_id": meta["clone_id"],
                 "target_id": meta["target_id"],
                 "primer": meta["primer"],
-                "clone_union_status": "PASS",
+                "clone_union_status": clone_status[key],
                 "worth_ab1": "YES",
             }
         )
@@ -299,13 +314,14 @@ def main() -> None:
     for tid in target_ids:
         gene_clones = [r for r in clone_rows if r["target_id"] == tid]
         n_pass = sum(1 for r in gene_clones if r["stage1_status"] == "PASS")
+        n_review = sum(1 for r in gene_clones if r["stage1_status"] == "PASS_INSERT_REVIEW")
         targets_view.append(
             {
                 "target_id": tid,
                 "ref_len": len(targets[tid].sequence),
                 "n_clones": len(gene_clones),
                 "n_pass_clones": n_pass,
-                "target_not_failed": "YES" if n_pass > 0 else "NO",
+                "target_not_failed": "YES" if (n_pass + n_review) > 0 else "NO",
                 "best_success_ratio": max((r["success_ratio"] for r in gene_clones), default=0.0),
                 "pass_clone_ids": "|".join(
                     r["clone_id"] for r in gene_clones if r["stage1_status"] == "PASS"
@@ -334,6 +350,8 @@ def main() -> None:
             "match_bp",
             "mismatch_bp",
             "internal_insert_bp",
+            "insert_status",
+            "insert_evidence",
             "read_len",
         ],
     )
@@ -352,9 +370,12 @@ def main() -> None:
             "uncovered_bp",
             "mismatch_only_bp",
             "internal_insert_bp",
+            "insert_status",
+            "insert_evidence",
             "success_ratio",
             "coverage_ratio",
             "n_reads_used",
+            "bases_perfect",
             "perfect",
             "stage1_status",
         ],
@@ -386,7 +407,6 @@ def main() -> None:
             "pass_clone_ids",
         ],
     )
-    # backward-compatible alias name
     write_csv(
         out / "stage1_genes_not_failed.csv",
         [
@@ -425,15 +445,18 @@ def main() -> None:
             "match_bp",
             "mismatch_bp",
             "internal_insert_bp",
+            "insert_status",
+            "insert_evidence",
             "read_len",
         ],
     )
 
     n_pass = sum(1 for r in clone_rows if r["stage1_status"] == "PASS")
+    n_review = sum(1 for r in clone_rows if r["stage1_status"] == "PASS_INSERT_REVIEW")
     n_ok = sum(1 for r in targets_view if r["target_not_failed"] == "YES")
     print(f"reads_dir={args.reads_dir}")
     print(f"targets={len(targets)} clones={len(clone_rows)} seq_reads={len(per_read)}")
-    print(f"clone_PASS={n_pass} FAIL={len(clone_rows) - n_pass}")
+    print(f"clone_PASS={n_pass} PASS_INSERT_REVIEW={n_review} FAIL={len(clone_rows) - n_pass - n_review}")
     print(f"targets_not_failed={n_ok}/{len(targets)}")
     print(f"files_worth_ab1={len(files_worth)}")
     print(f"out_dir={out}")

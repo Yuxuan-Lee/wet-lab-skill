@@ -3,6 +3,9 @@
 
 Uses the same --targets / --assignments model as stage-1.
 Only AB1 files listed in stage1_files_worth_ab1.csv are analyzed.
+
+Base correctness: UNION over primers at each reference position (+ peak gate).
+Insertions: independent boundary events, validated against chromatogram peaks.
 """
 
 from __future__ import annotations
@@ -10,9 +13,8 @@ from __future__ import annotations
 import argparse
 import csv
 import warnings
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from Bio.Seq import Seq
 
@@ -26,6 +28,19 @@ from common import (
     load_targets,
     resolve_read_path,
     validate_assignments,
+)
+from insertion import (
+    STATUS_CONFIRMED,
+    STATUS_CONFLICT,
+    STATUS_NO_INSERT,
+    STATUS_POSSIBLE,
+    InsertionCandidate,
+    NoInsertSpan,
+    ab1_peak_ok_for_flanks,
+    ab1_peak_ok_for_insert,
+    candidates_from_alignment,
+    no_insert_spans_from_alignment,
+    validate_insert_with_ab1,
 )
 
 COMPLEMENT = str.maketrans("ACGTacgt", "TGCAtgca")
@@ -71,25 +86,6 @@ def extract_ab1(path: Path) -> Tuple[str, List[Dict[str, int]]]:
     return bases[:n], heights
 
 
-def count_internal_inserts(ref_aln: str, query_aln: str, ref_len: int) -> int:
-    ref_pos = 0
-    inserts = 0
-    for rc, qc in zip(ref_aln, query_aln):
-        if rc == "-" and qc != "-" and 0 < ref_pos < ref_len:
-            inserts += 1
-        if rc != "-":
-            ref_pos += 1
-    return inserts
-
-
-def trusted_internal_inserts(inserts: int, match_bp: int, ref_len: int, identity: float) -> int:
-    if ref_len <= 0 or inserts <= 0:
-        return 0
-    if match_bp >= int(0.90 * ref_len) and identity >= 0.95:
-        return inserts
-    return 0
-
-
 def peak_frac_for_ref_base(heights: Dict[str, int], ref_base: str, orientation: str) -> float:
     rb = ref_base.upper()
     if rb not in "GATC":
@@ -106,16 +102,29 @@ def align_ab1_support(
     heights: List[Dict[str, int]],
     ref_seq: str,
     peak_min: float,
-) -> Tuple[Dict[int, str], Dict[int, float], float, int, str, int, int]:
+    primer: str = "",
+) -> Tuple[
+    Dict[int, str],
+    Dict[int, float],
+    float,
+    int,
+    str,
+    int,
+    List[InsertionCandidate],
+    List[NoInsertSpan],
+    Optional[bool],
+    Optional[bool],
+]:
     def one(query: str, orientation: str):
         aln = pairwise2.align.localms(
             ref_seq, query, 2.0, -1.0, -7.0, -1.0, one_alignment_only=True
         )
         if not aln:
-            return {}, {}, 0.0, 0, 0, 0
+            return {}, {}, 0.0, 0, 0, [], [], None, None
         a = aln[0]
         calls: Dict[int, str] = {}
         fracs: Dict[int, float] = {}
+        ref_to_query: Dict[int, int] = {}
         ref_pos = query_pos = 0
         match = aligned = support = 0
         n = len(bases)
@@ -126,6 +135,7 @@ def align_ab1_support(
                     frac = peak_frac_for_ref_base(heights[raw_idx], rc, orientation)
                     calls[ref_pos] = qc
                     fracs[ref_pos] = frac
+                    ref_to_query[ref_pos] = raw_idx
                     aligned += 1
                     if qc == rc:
                         match += 1
@@ -136,22 +146,44 @@ def align_ab1_support(
             if qc != "-":
                 query_pos += 1
         ident = (match / aligned) if aligned else 0.0
-        raw_ins = count_internal_inserts(a.seqA, a.seqB, len(ref_seq))
-        inserts = trusted_internal_inserts(raw_ins, match, len(ref_seq), ident)
-        return calls, fracs, ident, aligned, support, inserts
+        cands = candidates_from_alignment(ref_seq, a.seqA, a.seqB, len(query), primer=primer)
+        spans = no_insert_spans_from_alignment(a.seqA, a.seqB, primer=primer)
 
-    c1, f1, i1, a1, s1, n1 = one(bases, "as_is")
-    c2, f2, i2, a2, s2, n2 = one(str(Seq(bases).reverse_complement()), "RC_of_read")
-    if (s2, -n2, a2, i2) > (s1, -n1, a1, i1):
-        return c2, f2, i2, a2, "RC_of_read", s2, n2
-    return c1, f1, i1, a1, "as_is", s1, n1
+        # Peak validation for best HC insert (if any)
+        insert_peak_ok: Optional[bool] = None
+        flank_peak_ok: Optional[bool] = None
+        hc = [c for c in cands if c.high_confidence]
+        if hc:
+            c = hc[0]
+            # Map insert query coords to raw chromatogram indices
+            q_indices = []
+            q_bases = []
+            for qi, b in enumerate(c.inserted_seq):
+                qpos = c.query_start + qi
+                raw_idx = qpos if orientation == "as_is" else (n - 1 - qpos)
+                q_indices.append(raw_idx)
+                q_bases.append(b)
+            insert_peak_ok = ab1_peak_ok_for_insert(heights, q_indices, q_bases, orientation)
+            flank_peak_ok = ab1_peak_ok_for_flanks(
+                heights, ref_to_query, ref_seq, c.after_ref_pos, orientation, peak_min=peak_min
+            )
+        return calls, fracs, ident, aligned, support, cands, spans, insert_peak_ok, flank_peak_ok
+
+    r1 = one(bases, "as_is")
+    r2 = one(str(Seq(bases).reverse_complement()), "RC_of_read")
+    c1, f1, i1, a1, s1, n1, sp1, ip1, fp1 = r1
+    c2, f2, i2, a2, s2, n2, sp2, ip2, fp2 = r2
+    hc1 = sum(1 for c in n1 if c.high_confidence)
+    hc2 = sum(1 for c in n2 if c.high_confidence)
+    if (s2, -hc2, a2, i2) > (s1, -hc1, a1, i1):
+        return c2, f2, i2, a2, "RC_of_read", s2, n2, sp2, ip2, fp2
+    return c1, f1, i1, a1, "as_is", s1, n1, sp1, ip1, fp1
 
 
-def evaluate_union(
+def evaluate_base_union(
     ref_seq: str,
     primer_calls: Dict[str, Dict[int, str]],
     primer_fracs: Dict[str, Dict[int, float]],
-    primer_inserts: Dict[str, int],
     peak_min: float,
 ) -> dict:
     ref_len = len(ref_seq)
@@ -175,7 +207,6 @@ def evaluate_union(
             peak_fail_only += 1
         else:
             mismatch_only += 1
-    insert_bp = int(sum(primer_inserts.values()))
     return {
         "ref_len": ref_len,
         "success_bp": success,
@@ -184,12 +215,23 @@ def evaluate_union(
         "uncovered_bp": ref_len - covered,
         "mismatch_only_bp": mismatch_only,
         "peak_fail_only_bp": peak_fail_only,
-        "internal_insert_bp": insert_bp,
         "success_ratio": round(success / ref_len, 4) if ref_len else 0.0,
         "coverage_ratio": round(covered / ref_len, 4) if ref_len else 0.0,
         "n_reads_used": len(primer_calls),
-        "perfect": success == ref_len and insert_bp == 0,
+        "bases_perfect": success == ref_len,
     }
+
+
+def stage2_status(bases_perfect: bool, insert_status: str) -> str:
+    if not bases_perfect:
+        return "FAIL"
+    if insert_status == STATUS_NO_INSERT:
+        return "PASS"
+    if insert_status in (STATUS_POSSIBLE, STATUS_CONFLICT):
+        return "REVIEW"
+    if insert_status == STATUS_CONFIRMED:
+        return "FAIL"
+    return "REVIEW"
 
 
 def write_csv(path: Path, rows: List[dict], fieldnames: List[str]) -> None:
@@ -227,9 +269,10 @@ def main() -> None:
         if path is None:
             missing.append(name)
             continue
-        asg = asg_by_file.get(path.name) or asg_by_file.get(name) or asg_by_file.get(Path(name).with_suffix(".seq").name)
+        asg = asg_by_file.get(path.name) or asg_by_file.get(name) or asg_by_file.get(
+            Path(name).with_suffix(".seq").name
+        )
         if asg is None:
-            # try stem match against assignment files
             stem = path.stem.lower()
             asg = next((a for a in assignments if Path(a.file).stem.lower() == stem), None)
         if asg is None:
@@ -242,17 +285,27 @@ def main() -> None:
             errors.append(f"parse:{path.name}:{e}")
             continue
 
-        calls, fracs, ident, aln_len, ori, support_n, inserts = align_ab1_support(
-            bases, heights, ref.sequence, args.peak_min
-        )
+        primer = asg.primer
+        (
+            calls,
+            fracs,
+            ident,
+            aln_len,
+            ori,
+            support_n,
+            cands,
+            spans,
+            insert_peak_ok,
+            flank_peak_ok,
+        ) = align_ab1_support(bases, heights, ref.sequence, args.peak_min, primer=primer)
         match_n = sum(1 for pos, b in calls.items() if b == ref.sequence[pos])
         peak_ok_n = sum(
             1
             for pos, b in calls.items()
             if b == ref.sequence[pos] and fracs.get(pos, 0.0) >= args.peak_min
         )
+        hc_bp = sum(c.insert_len for c in cands if c.high_confidence)
         key = group_key(asg.target_id, asg.clone_id)
-        primer = asg.primer
         slot = by_clone.setdefault(
             key,
             {
@@ -263,7 +316,10 @@ def main() -> None:
                 "primer_fracs": {},
                 "primer_files": {},
                 "primer_support": {},
-                "primer_inserts": {},
+                "primer_candidates": {},
+                "primer_no_insert": {},
+                "primer_insert_peak_ok": {},
+                "primer_flank_peak_ok": {},
             },
         )
         if support_n > slot["primer_support"].get(primer, -1):
@@ -271,7 +327,12 @@ def main() -> None:
             slot["primer_fracs"][primer] = fracs
             slot["primer_files"][primer] = path.name
             slot["primer_support"][primer] = support_n
-            slot["primer_inserts"][primer] = inserts
+            slot["primer_candidates"][primer] = cands
+            slot["primer_no_insert"][primer] = spans
+            if insert_peak_ok is not None:
+                slot["primer_insert_peak_ok"][primer] = insert_peak_ok
+            if flank_peak_ok is not None:
+                slot["primer_flank_peak_ok"][primer] = flank_peak_ok
 
         meta = {
             "file": path.name,
@@ -284,7 +345,9 @@ def main() -> None:
             "match_bp": match_n,
             "peak_ok_bp": peak_ok_n,
             "support_bp": support_n,
-            "internal_insert_bp": inserts,
+            "internal_insert_bp": hc_bp,
+            "insert_status": "",
+            "insert_evidence": ";".join(c.summary() for c in cands if c.high_confidence),
             "read_len": len(bases),
             "peak_min": args.peak_min,
         }
@@ -293,16 +356,20 @@ def main() -> None:
 
     clone_rows: List[dict] = []
     clone_status: Dict[str, str] = {}
+    clone_insert: Dict[str, str] = {}
     for key, slot in sorted(by_clone.items()):
-        stats = evaluate_union(
-            slot["ref_seq"],
-            slot["primer_calls"],
-            slot["primer_fracs"],
-            slot["primer_inserts"],
-            args.peak_min,
+        base = evaluate_base_union(
+            slot["ref_seq"], slot["primer_calls"], slot["primer_fracs"], args.peak_min
         )
-        status = "PASS" if stats["perfect"] else "FAIL"
+        ins = validate_insert_with_ab1(
+            slot["primer_candidates"],
+            slot["primer_no_insert"],
+            slot["primer_insert_peak_ok"],
+            slot["primer_flank_peak_ok"],
+        )
+        status = stage2_status(base["bases_perfect"], ins.status)
         clone_status[key] = status
+        clone_insert[key] = ins.status
         primers = sorted(slot["primer_files"])
         clone_rows.append(
             {
@@ -310,7 +377,11 @@ def main() -> None:
                 "clone_id": slot["clone_id"],
                 "primers": "|".join(primers),
                 "files": "|".join(slot["primer_files"][p] for p in primers),
-                **stats,
+                **base,
+                "internal_insert_bp": ins.internal_insert_bp,
+                "insert_status": ins.status,
+                "insert_evidence": ins.evidence,
+                "perfect": base["bases_perfect"] and ins.status == STATUS_NO_INSERT,
                 "peak_min": args.peak_min,
                 "stage2_status": status,
             }
@@ -324,7 +395,6 @@ def main() -> None:
         row: dict = {"target_id": tid, "ref_len": len(targets[tid].sequence)}
         for fname in ab1_names:
             meta = file_to_meta.get(fname) or file_to_meta.get(Path(fname).name)
-            # also try resolved actual names
             if meta is None:
                 for m in per_read:
                     if m["file"] == fname or Path(m["file"]).stem == Path(fname).stem:
@@ -350,6 +420,7 @@ def main() -> None:
                     "peak_ok_bp": meta["peak_ok_bp"],
                     "support_bp": meta["support_bp"],
                     "internal_insert_bp": meta["internal_insert_bp"],
+                    "insert_status": clone_insert.get(key, ""),
                     "peak_min": args.peak_min,
                 }
             )
@@ -416,6 +487,7 @@ def main() -> None:
             "peak_ok_bp",
             "support_bp",
             "internal_insert_bp",
+            "insert_status",
             "peak_min",
         ],
     )
@@ -435,9 +507,12 @@ def main() -> None:
             "mismatch_only_bp",
             "peak_fail_only_bp",
             "internal_insert_bp",
+            "insert_status",
+            "insert_evidence",
             "success_ratio",
             "coverage_ratio",
             "n_reads_used",
+            "bases_perfect",
             "perfect",
             "peak_min",
             "stage2_status",
@@ -500,16 +575,22 @@ def main() -> None:
             "peak_ok_bp",
             "support_bp",
             "internal_insert_bp",
+            "insert_status",
+            "insert_evidence",
             "read_len",
             "peak_min",
         ],
     )
 
     n_pass = sum(1 for r in clone_rows if r["stage2_status"] == "PASS")
+    n_review = sum(1 for r in clone_rows if r["stage2_status"] == "REVIEW")
     n_ok = sum(1 for r in targets_view if r["target_not_failed"] == "YES")
     print(f"reads_dir={args.reads_dir}")
     print(f"worth={len(worth)} parsed={len(per_read)} missing={len(missing)} errors={len(errors)}")
-    print(f"clones={len(clone_rows)} PASS={n_pass} FAIL={len(clone_rows) - n_pass}")
+    print(
+        f"clones={len(clone_rows)} PASS={n_pass} REVIEW={n_review} "
+        f"FAIL={len(clone_rows) - n_pass - n_review}"
+    )
     print(f"targets_not_failed={n_ok}/{len(target_ids)}")
     print(f"peak_min={args.peak_min} out_dir={out}")
     if missing[:3]:

@@ -23,3 +23,14 @@ Optional HER2-style filename helper only:
 ```bash
 python draft_her2_inputs.py --insert-csv pcr_insert_flanks.csv --reads-dir READS --aliases aliases.json --out-dir drafted_inputs
 ```
+
+## Insertion thresholds
+
+See `insertion.py` (`LOCAL_IDENTITY_MIN`, `FLANK_MATCH_MIN_BP`, `EDGE_MARGIN_BP`, …).
+Base union and insertion evidence are separate tracks.
+
+## Tests
+
+```bash
+python -m unittest tests.test_insertion -v
+```

@@ -67,14 +67,13 @@ python toolkit/export_final_sample_matrix.py \
 ## Scoring (summary)
 
 - Reference = user target sequence
-- Per clone: **union of all assigned primers** (2–N)
-- Stage-1 site SUCCESS if any primer calls the reference base; uncovered/mismatch = fail
-- Trusted internal inserts (high-confidence alignment only) → fail
-- Stage-2 also requires correct-base peak fraction ≥ **0.75**
-- Clone PASS ⇔ every target base succeeds and no trusted inserts
-- Final `CORRECT` sample = stage-2 PASS clone (collect return plasmid)
+- **Base correctness** = reference-**position** union (any good primer OK)
+- **Insertion** = reference-**boundary** event (separate merge; local flank gate)
+- Stage-1: discover HC inserts → `INSERT_CANDIDATE` / `STRONG_INSERT` / `INSERT_CONFLICT`
+- Stage-2: peak ≥ **0.75** for bases; AB1 validates inserts → `CONFIRMED` / `POSSIBLE` / `CONFLICT`
+- Final `CORRECT` = stage-2 PASS (bases OK + `NO_INSERT_EVIDENCE`); `POSSIBLE`/`CONFLICT` → `REVIEW`
 
-High-confidence for insert trust: `match_bp ≥ 0.90 × ref_len` and `identity ≥ 0.95`.
+Insert HC defaults (`toolkit/insertion.py`): local identity ≥0.95, flanks ≥20 bp each, not within 25 bp of read edge. **No** whole-target 90% coverage gate.
 
 ## Agent checklist
 
@@ -96,10 +95,12 @@ README.md
 examples/
 toolkit/
   common.py
+  insertion.py           # boundary insertion logic + thresholds
   stage1_seq_matrix.py
   stage2_ab1_matrix.py
   export_final_sample_matrix.py
   draft_her2_inputs.py   # optional naming helper only
+  tests/test_insertion.py
 ```
 
 See [reference.md](reference.md) and [toolkit/README.md](toolkit/README.md).

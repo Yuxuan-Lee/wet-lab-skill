@@ -43,7 +43,12 @@
 | Stage-2 | `.ab1`（仅 stage-1 合格） | 正确碱基峰纯度 ≥ 75% |
 | Final | 克隆表 | target × **样品**（多引物合并）→ 返样清单 |
 
-同一 `clone_id` 下所有 primer 的读段做 **并集**：任一端覆盖且读对即可。
+同一 `clone_id` 下：
+
+- **碱基正确性**：按 reference **位点**做并集（任一可靠 read 读对即可）
+- **Insertion**：按 reference **边界**单独合并（局部侧翼质量门控；**不再**用整段 target 90% 覆盖率）
+
+详见 [reference.md](reference.md)。
 
 ### 安装
 
