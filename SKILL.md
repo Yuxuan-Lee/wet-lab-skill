@@ -79,12 +79,12 @@ Insert HC defaults (`toolkit/insertion.py`): local identity ≥0.95, flanks ≥2
 ## Agent checklist
 
 ```
-- [ ] Get targets file (or write one from user sequences)
-- [ ] Confirm targets are within primer coverage
-- [ ] Draft/confirm assignments.csv (which reads belong where; multi-primer OK)
+- [ ] Ask user for reads directory + what they want verified (sequences and which files go together)
+- [ ] Draft targets.csv / assignments.csv from their description (or files they provide); user confirms
+- [ ] Confirm targets are within primer coverage; omit off-target reads
 - [ ] Run stage-1 → report
 - [ ] Run stage-2 on worth files → report
-- [ ] Export final target×sample return list
+- [ ] Export final target×sample return list (+ review list if insertions)
 ```
 
 ## Package layout
