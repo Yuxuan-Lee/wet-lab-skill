@@ -1,0 +1,6 @@
+{
+  "aliases": {
+    "3971": "h5971-1"
+  },
+  "notes": "Key = sequencing sample prefix before the clone suffix (e.g. 3971-3 -> prefix 3971). Value = vendor_id in pcr_insert_flanks.csv."
+}

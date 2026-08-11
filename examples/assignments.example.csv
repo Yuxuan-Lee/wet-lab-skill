@@ -1,0 +1,6 @@
+file,target_id,clone_id,primer
+S2608100001_cloneA-1_T7_A01.seq,example_insert,cloneA-1,T7
+S2608100001_cloneA-1_internal_A02.seq,example_insert,cloneA-1,INTERNAL
+S2608100001_cloneA-1_T7T_A03.seq,example_insert,cloneA-1,T7T
+S2608100002_cloneA-2_T7_B01.seq,example_insert,cloneA-2,T7
+S2608100002_cloneA-2_T7T_B02.seq,example_insert,cloneA-2,T7T
