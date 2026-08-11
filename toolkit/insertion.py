@@ -8,6 +8,7 @@ alignment quality around each boundary — never by whole-target coverage.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # --- configurable thresholds (keep centralized) ---
@@ -322,11 +323,31 @@ def _same_event(a: InsertionCandidate, b: InsertionCandidate) -> bool:
     return not (a.interval_end < b.interval_start - 1 or b.interval_end < a.interval_start - 1)
 
 
+def event_key(cand: InsertionCandidate) -> Tuple[int, int, str]:
+    """Stable id for an insertion event: (interval_start, interval_end, inserted_seq)."""
+    return (int(cand.interval_start), int(cand.interval_end), str(cand.inserted_seq))
+
+
+def event_key_from_dict(ev: dict) -> Tuple[int, int, str]:
+    return (int(ev["interval_start"]), int(ev["interval_end"]), str(ev["inserted_seq"]))
+
+
+def evidence_id(primer: str, file_name: str) -> str:
+    """Unique evidence unit: same primer can have replicate files."""
+    return f"{primer}::{Path(file_name).name}" if file_name else primer
+
+
+def peak_evidence_key(primer: str, cand: InsertionCandidate) -> Tuple[str, int, int, str]:
+    """(evidence_id, interval_start, interval_end, inserted_seq)."""
+    ek = event_key(cand)
+    return (primer, ek[0], ek[1], ek[2])
+
+
 def merge_clone_insertions(
     primer_candidates: Dict[str, Sequence[InsertionCandidate]],
     primer_no_insert: Optional[Dict[str, Sequence[NoInsertSpan]]] = None,
 ) -> CloneInsertResult:
-    """Merge per-primer insertion evidence by reference boundary."""
+    """Merge per-read/primer insertion evidence by reference boundary."""
     primer_no_insert = primer_no_insert or {}
     hc: List[InsertionCandidate] = []
     for primer, cands in primer_candidates.items():
@@ -365,12 +386,11 @@ def merge_clone_insertions(
         primers = sorted({c.primer for c in cl})
         rep = cl[0]
         total_bp += rep.insert_len
-        # Conflict if another primer has HC NO_INSERT spanning boundary and no HC insert there
+        # Conflict if another evidence unit has HC NO_INSERT spanning boundary
         conflict = False
         for primer, spans in primer_no_insert.items():
             if primer in primers:
                 continue
-            # If this primer also has an HC insert for same event, not a NO_INSERT witness
             other_hc = primer_candidates.get(primer, [])
             if any(x.high_confidence and _same_event(x, rep) for x in other_hc):
                 continue
@@ -389,8 +409,10 @@ def merge_clone_insertions(
             st = STATUS_CANDIDATE
 
         event_statuses.append(st)
+        ek = event_key(rep)
         ev = {
             "status": st,
+            "event_key": f"{ek[0]}-{ek[1]}+{ek[2]}",
             "after_ref_pos": rep.after_ref_pos,
             "interval_start": rep.interval_start,
             "interval_end": rep.interval_end,
@@ -420,54 +442,88 @@ def merge_clone_insertions(
     )
 
 
+def _peak_ok_for_event(
+    ev: dict,
+    event_peak_ok: Dict[Tuple[str, int, int, str], bool],
+    event_flank_ok: Dict[Tuple[str, int, int, str], bool],
+) -> Tuple[str, Optional[bool]]:
+    """Return (label, ok) where ok is True/False/None(unknown) for one event."""
+    primers = [p for p in str(ev.get("primers", "")).split("|") if p]
+    ek = event_key_from_dict(ev)
+    any_ok = False
+    any_fail = False
+    any_unknown = False
+    for p in primers:
+        key = (p, ek[0], ek[1], ek[2])
+        if key not in event_peak_ok or key not in event_flank_ok:
+            any_unknown = True
+            continue
+        if event_peak_ok[key] and event_flank_ok[key]:
+            any_ok = True
+        else:
+            any_fail = True
+    if any_ok and not any_fail and not any_unknown:
+        return ("confirmed", True)
+    if any_ok or any_fail or any_unknown:
+        return ("possible", False)
+    return ("unknown", None)
+
+
 def validate_insert_with_ab1(
     primer_candidates: Dict[str, Sequence[InsertionCandidate]],
     primer_no_insert: Dict[str, Sequence[NoInsertSpan]],
-    primer_insert_peak_ok: Dict[str, bool],
-    primer_flank_peak_ok: Dict[str, bool],
+    event_insert_peak_ok: Dict[Tuple[str, int, int, str], bool],
+    event_flank_peak_ok: Dict[Tuple[str, int, int, str], bool],
 ) -> CloneInsertResult:
-    """Promote/demote stage-1 insert evidence using AB1 peak checks.
+    """Promote/demote each insertion event using AB1 peak checks.
 
-    If AB1 peak validation is inconclusive, keep POSSIBLE_INSERT (never silent drop).
+    Peak maps are keyed by (evidence_id, interval_start, interval_end, inserted_seq).
+    Each event is scored independently; clone status aggregates:
+      any CONFIRMED → CONFIRMED_INSERT
+      else any CONFLICT → INSERT_CONFLICT
+      else any POSSIBLE → POSSIBLE_INSERT
+      else NO_INSERT_EVIDENCE
     """
     base = merge_clone_insertions(primer_candidates, primer_no_insert)
     if base.status == STATUS_NO_INSERT:
         return base
 
-    if base.status == STATUS_CONFLICT:
-        return CloneInsertResult(
-            status=STATUS_CONFLICT,
-            internal_insert_bp=base.internal_insert_bp,
-            evidence=base.evidence,
-            events=[{**e, "status": STATUS_CONFLICT} for e in base.events],
+    out_events: List[dict] = []
+    event_statuses: List[str] = []
+    evidence_bits: List[str] = []
+
+    for ev in base.events:
+        # Preserve stage-1 conflict at event level
+        if ev.get("status") == STATUS_CONFLICT:
+            st = STATUS_CONFLICT
+        else:
+            label, _ = _peak_ok_for_event(ev, event_insert_peak_ok, event_flank_peak_ok)
+            if label == "confirmed":
+                st = STATUS_CONFIRMED
+            else:
+                # inconclusive or mixed peaks → POSSIBLE (never silent clear)
+                st = STATUS_POSSIBLE
+        out_events.append({**ev, "status": st})
+        event_statuses.append(st)
+        evidence_bits.append(
+            f"{st}:ins@{ev['interval_start']}-{ev['interval_end']}+{ev['inserted_seq']}"
+            f"[{ev.get('primers', '')}]"
         )
 
-    any_peak_ok = False
-    any_peak_fail = False
-    any_unknown = False
-    for ev in base.events:
-        for p in str(ev["primers"]).split("|"):
-            if not p:
-                continue
-            if p not in primer_insert_peak_ok or p not in primer_flank_peak_ok:
-                any_unknown = True
-                continue
-            if primer_insert_peak_ok[p] and primer_flank_peak_ok[p]:
-                any_peak_ok = True
-            else:
-                any_peak_fail = True
-
-    # Confirmed only when peaks clearly support; otherwise POSSIBLE (never silent clear)
-    if any_peak_ok and not any_peak_fail and not any_unknown:
-        st = STATUS_CONFIRMED
+    if STATUS_CONFIRMED in event_statuses:
+        status = STATUS_CONFIRMED
+    elif STATUS_CONFLICT in event_statuses:
+        status = STATUS_CONFLICT
+    elif STATUS_POSSIBLE in event_statuses:
+        status = STATUS_POSSIBLE
     else:
-        st = STATUS_POSSIBLE
+        status = STATUS_NO_INSERT
 
     return CloneInsertResult(
-        status=st,
+        status=status,
         internal_insert_bp=base.internal_insert_bp,
-        evidence=base.evidence.replace(STATUS_CANDIDATE, st).replace(STATUS_STRONG, st),
-        events=[{**e, "status": st} for e in base.events],
+        evidence=";".join(evidence_bits),
+        events=out_events,
     )
 
 

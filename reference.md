@@ -57,6 +57,10 @@ There is **no** `match_bp ≥ 0.90 × ref_len` gate (that caused miss on long ta
 
 Homopolymer / repeat: boundaries may widen to an interval (e.g. positions 120–124).
 
+Stage-2 AB1 peak checks are **per insertion event** `(evidence_id, interval, inserted_seq)`, not a single bool per primer. Same-primer replicate files are separate evidence units (`primer::filename`).
+
+Targets: whitespace stripped; **non-ACGT bases (N/IUPAC) raise a loud error** — never silently deleted.
+
 Stage-1 clone status: `PASS` (bases OK, no insert) or `PASS_INSERT_REVIEW` (bases OK, insert needs AB1) — both go to stage-2 worth list.
 
 ### Stage-2 validation statuses

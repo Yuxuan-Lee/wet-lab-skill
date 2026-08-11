@@ -24,8 +24,21 @@ class Assignment:
     primer: str
 
 
-def _norm_dna(s: str) -> str:
-    return re.sub(r"[^ACGTacgt]", "", s).upper()
+def _norm_dna(s: str, *, target_id: str = "") -> str:
+    """Strip whitespace only; refuse IUPAC/N/other non-ACGT (never silently delete)."""
+    cleaned = re.sub(r"\s+", "", s).upper()
+    for i, ch in enumerate(cleaned):
+        if ch not in "ACGT":
+            where = f"target {target_id}" if target_id else "sequence"
+            raise SystemExit(
+                f"Invalid target sequence: {where} contains unsupported base "
+                f"'{ch}' at position {i + 1}. Only A/C/G/T are allowed "
+                f"(whitespace is stripped; N/IUPAC are not silently removed)."
+            )
+    if not cleaned:
+        where = f"target {target_id}" if target_id else "sequence"
+        raise SystemExit(f"Invalid target sequence: {where} is empty after stripping whitespace.")
+    return cleaned
 
 
 def load_targets(path: Path) -> Dict[str, Target]:
@@ -51,13 +64,13 @@ def load_targets(path: Path) -> Dict[str, Target]:
                 continue
             if line.startswith(">"):
                 if tid and chunks:
-                    out[tid] = Target(tid, _norm_dna("".join(chunks)))
+                    out[tid] = Target(tid, _norm_dna("".join(chunks), target_id=tid))
                 tid = line[1:].split()[0]
                 chunks = []
             else:
                 chunks.append(line)
         if tid and chunks:
-            out[tid] = Target(tid, _norm_dna("".join(chunks)))
+            out[tid] = Target(tid, _norm_dna("".join(chunks), target_id=tid))
     else:
         with path.open(encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
@@ -78,7 +91,7 @@ def load_targets(path: Path) -> Dict[str, Target]:
                 )
                 if not tid or not seq:
                     raise SystemExit(f"bad targets row in {path}: need target_id + sequence")
-                out[tid] = Target(tid, _norm_dna(seq))
+                out[tid] = Target(tid, _norm_dna(seq, target_id=tid))
 
     if not out:
         raise SystemExit(f"no targets loaded from {path}")

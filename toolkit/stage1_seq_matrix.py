@@ -34,12 +34,11 @@ from common import (
 )
 from insertion import (
     STATUS_CANDIDATE,
-    STATUS_CONFLICT,
     STATUS_NO_INSERT,
-    STATUS_STRONG,
     InsertionCandidate,
     NoInsertSpan,
     candidates_from_alignment,
+    evidence_id,
     merge_clone_insertions,
     no_insert_spans_from_alignment,
 )
@@ -176,7 +175,12 @@ def main() -> None:
         ref = targets[asg_use.target_id]
         seq = read_seq_file(path)
         primer = asg_use.primer
-        calls, ident, aln_len, ori, cands, spans = align_calls(seq, ref.sequence, primer=primer)
+        eid = evidence_id(primer, path.name)
+        calls, ident, aln_len, ori, cands, spans = align_calls(seq, ref.sequence, primer=eid)
+        for c in cands:
+            c.primer = eid
+        for sp in spans:
+            sp.primer = eid
         match_n = sum(1 for pos, b in calls.items() if b == ref.sequence[pos])
         mism_n = len(calls) - match_n
         hc_bp = sum(c.insert_len for c in cands if c.high_confidence)
@@ -192,20 +196,23 @@ def main() -> None:
                 "primer_files": {},
                 "primer_candidates": {},
                 "primer_no_insert": {},
+                "display_primers": {},
             },
         )
-        prev = slot["primer_calls"].get(primer)
+        prev = slot["primer_calls"].get(eid)
         if prev is None or len(calls) > len(prev):
-            slot["primer_calls"][primer] = calls
-            slot["primer_files"][primer] = path.name
-            slot["primer_candidates"][primer] = cands
-            slot["primer_no_insert"][primer] = spans
+            slot["primer_calls"][eid] = calls
+            slot["primer_files"][eid] = path.name
+            slot["primer_candidates"][eid] = cands
+            slot["primer_no_insert"][eid] = spans
+            slot["display_primers"][eid] = primer
 
         meta = {
             "file": path.name,
             "clone_id": asg_use.clone_id,
             "target_id": asg_use.target_id,
             "primer": primer,
+            "evidence_id": eid,
             "orientation": ori,
             "aligned_len": aln_len,
             "identity": round(ident, 4),
@@ -228,13 +235,14 @@ def main() -> None:
         ins = merge_clone_insertions(slot["primer_candidates"], slot["primer_no_insert"])
         status = stage1_status(base["bases_perfect"], ins.status)
         clone_status[key] = status
-        primers = sorted(slot["primer_files"])
+        eids = sorted(slot["primer_files"])
+        primers_disp = sorted({slot["display_primers"].get(e, e.split("::")[0]) for e in eids})
         clone_rows.append(
             {
                 "target_id": slot["target_id"],
                 "clone_id": slot["clone_id"],
-                "primers": "|".join(primers),
-                "files": "|".join(slot["primer_files"][p] for p in primers),
+                "primers": "|".join(primers_disp),
+                "files": "|".join(slot["primer_files"][e] for e in eids),
                 **base,
                 "internal_insert_bp": ins.internal_insert_bp,
                 "insert_status": ins.status,
@@ -439,6 +447,7 @@ def main() -> None:
             "clone_id",
             "target_id",
             "primer",
+            "evidence_id",
             "orientation",
             "aligned_len",
             "identity",

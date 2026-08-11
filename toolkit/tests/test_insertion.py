@@ -282,5 +282,60 @@ class TestInsertionBasics(unittest.TestCase):
         self.assertEqual(len(merged.events), 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestPerEventAb1Validation(unittest.TestCase):
+    def _hc_cand(self, after: int, seq: str, primer: str) -> InsertionCandidate:
+        return InsertionCandidate(
+            after_ref_pos=after,
+            inserted_seq=seq,
+            interval_start=after - 1,
+            interval_end=after,
+            left_flank_match_bp=25,
+            right_flank_match_bp=25,
+            local_identity=1.0,
+            distance_to_read_edge=40,
+            high_confidence=True,
+            primer=primer,
+        )
+
+    def test_two_events_independent_peak_status(self):
+        from insertion import (
+            STATUS_CONFIRMED,
+            STATUS_POSSIBLE,
+            validate_insert_with_ab1,
+        )
+
+        p = "T7::read.ab1"
+        c1 = self._hc_cand(100, "A", p)
+        c2 = self._hc_cand(300, "GGG", p)
+        # Event1 peaks OK, event2 peaks fail — must NOT both become CONFIRMED
+        peak = {
+            (p, c1.interval_start, c1.interval_end, c1.inserted_seq): True,
+            (p, c2.interval_start, c2.interval_end, c2.inserted_seq): False,
+        }
+        flank = {
+            (p, c1.interval_start, c1.interval_end, c1.inserted_seq): True,
+            (p, c2.interval_start, c2.interval_end, c2.inserted_seq): False,
+        }
+        result = validate_insert_with_ab1({p: [c1, c2]}, {p: []}, peak, flank)
+        statuses = {e["inserted_seq"]: e["status"] for e in result.events}
+        self.assertEqual(statuses["A"], STATUS_CONFIRMED)
+        self.assertEqual(statuses["GGG"], STATUS_POSSIBLE)
+        # Clone aggregates to CONFIRMED if any event confirmed
+        self.assertEqual(result.status, STATUS_CONFIRMED)
+
+
+class TestNormDna(unittest.TestCase):
+    def test_rejects_n(self):
+        from common import _norm_dna
+
+        with self.assertRaises(SystemExit) as ctx:
+            _norm_dna("ACGTNACGT", target_id="HER2")
+        msg = str(ctx.exception)
+        self.assertIn("HER2", msg)
+        self.assertIn("'N'", msg)
+        self.assertIn("5", msg)
+
+    def test_strips_whitespace_only(self):
+        from common import _norm_dna
+
+        self.assertEqual(_norm_dna("acgt\nacgt", target_id="x"), "ACGTACGT")

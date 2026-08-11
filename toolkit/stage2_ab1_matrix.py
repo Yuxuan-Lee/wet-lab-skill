@@ -14,7 +14,7 @@ import argparse
 import csv
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from Bio.Seq import Seq
 
@@ -39,7 +39,9 @@ from insertion import (
     ab1_peak_ok_for_flanks,
     ab1_peak_ok_for_insert,
     candidates_from_alignment,
+    evidence_id,
     no_insert_spans_from_alignment,
+    peak_evidence_key,
     validate_insert_with_ab1,
 )
 
@@ -112,15 +114,15 @@ def align_ab1_support(
     int,
     List[InsertionCandidate],
     List[NoInsertSpan],
-    Optional[bool],
-    Optional[bool],
+    Dict[Tuple[str, int, int, str], bool],
+    Dict[Tuple[str, int, int, str], bool],
 ]:
     def one(query: str, orientation: str):
         aln = pairwise2.align.localms(
             ref_seq, query, 2.0, -1.0, -7.0, -1.0, one_alignment_only=True
         )
         if not aln:
-            return {}, {}, 0.0, 0, 0, [], [], None, None
+            return {}, {}, 0.0, 0, 0, [], [], {}, {}
         a = aln[0]
         calls: Dict[int, str] = {}
         fracs: Dict[int, float] = {}
@@ -149,13 +151,15 @@ def align_ab1_support(
         cands = candidates_from_alignment(ref_seq, a.seqA, a.seqB, len(query), primer=primer)
         spans = no_insert_spans_from_alignment(a.seqA, a.seqB, primer=primer)
 
-        # Peak validation for best HC insert (if any)
-        insert_peak_ok: Optional[bool] = None
-        flank_peak_ok: Optional[bool] = None
-        hc = [c for c in cands if c.high_confidence]
-        if hc:
-            c = hc[0]
-            # Map insert query coords to raw chromatogram indices
+        # Per-event AB1 peak validation (never only hc[0])
+        insert_peak_ok: Dict[Tuple[str, int, int, str], bool] = {}
+        flank_peak_ok: Dict[Tuple[str, int, int, str], bool] = {}
+        for c in cands:
+            if not c.high_confidence:
+                continue
+            if not c.primer:
+                c.primer = primer
+            key = peak_evidence_key(primer, c)
             q_indices = []
             q_bases = []
             for qi, b in enumerate(c.inserted_seq):
@@ -163,8 +167,10 @@ def align_ab1_support(
                 raw_idx = qpos if orientation == "as_is" else (n - 1 - qpos)
                 q_indices.append(raw_idx)
                 q_bases.append(b)
-            insert_peak_ok = ab1_peak_ok_for_insert(heights, q_indices, q_bases, orientation)
-            flank_peak_ok = ab1_peak_ok_for_flanks(
+            insert_peak_ok[key] = ab1_peak_ok_for_insert(
+                heights, q_indices, q_bases, orientation
+            )
+            flank_peak_ok[key] = ab1_peak_ok_for_flanks(
                 heights, ref_to_query, ref_seq, c.after_ref_pos, orientation, peak_min=peak_min
             )
         return calls, fracs, ident, aligned, support, cands, spans, insert_peak_ok, flank_peak_ok
@@ -286,6 +292,7 @@ def main() -> None:
             continue
 
         primer = asg.primer
+        eid = evidence_id(primer, path.name)
         (
             calls,
             fracs,
@@ -297,7 +304,12 @@ def main() -> None:
             spans,
             insert_peak_ok,
             flank_peak_ok,
-        ) = align_ab1_support(bases, heights, ref.sequence, args.peak_min, primer=primer)
+        ) = align_ab1_support(bases, heights, ref.sequence, args.peak_min, primer=eid)
+        # Keep candidate.primer as evidence id for merge; also tag display primer
+        for c in cands:
+            c.primer = eid
+        for sp in spans:
+            sp.primer = eid
         match_n = sum(1 for pos, b in calls.items() if b == ref.sequence[pos])
         peak_ok_n = sum(
             1
@@ -318,27 +330,28 @@ def main() -> None:
                 "primer_support": {},
                 "primer_candidates": {},
                 "primer_no_insert": {},
-                "primer_insert_peak_ok": {},
-                "primer_flank_peak_ok": {},
+                "event_insert_peak_ok": {},
+                "event_flank_peak_ok": {},
+                "display_primers": {},
             },
         )
-        if support_n > slot["primer_support"].get(primer, -1):
-            slot["primer_calls"][primer] = calls
-            slot["primer_fracs"][primer] = fracs
-            slot["primer_files"][primer] = path.name
-            slot["primer_support"][primer] = support_n
-            slot["primer_candidates"][primer] = cands
-            slot["primer_no_insert"][primer] = spans
-            if insert_peak_ok is not None:
-                slot["primer_insert_peak_ok"][primer] = insert_peak_ok
-            if flank_peak_ok is not None:
-                slot["primer_flank_peak_ok"][primer] = flank_peak_ok
+        if support_n > slot["primer_support"].get(eid, -1):
+            slot["primer_calls"][eid] = calls
+            slot["primer_fracs"][eid] = fracs
+            slot["primer_files"][eid] = path.name
+            slot["primer_support"][eid] = support_n
+            slot["primer_candidates"][eid] = cands
+            slot["primer_no_insert"][eid] = spans
+            slot["display_primers"][eid] = primer
+            slot["event_insert_peak_ok"].update(insert_peak_ok)
+            slot["event_flank_peak_ok"].update(flank_peak_ok)
 
         meta = {
             "file": path.name,
             "clone_id": asg.clone_id,
             "target_id": asg.target_id,
             "primer": primer,
+            "evidence_id": eid,
             "orientation": ori,
             "aligned_len": aln_len,
             "identity": round(ident, 4),
@@ -364,19 +377,20 @@ def main() -> None:
         ins = validate_insert_with_ab1(
             slot["primer_candidates"],
             slot["primer_no_insert"],
-            slot["primer_insert_peak_ok"],
-            slot["primer_flank_peak_ok"],
+            slot["event_insert_peak_ok"],
+            slot["event_flank_peak_ok"],
         )
         status = stage2_status(base["bases_perfect"], ins.status)
         clone_status[key] = status
         clone_insert[key] = ins.status
-        primers = sorted(slot["primer_files"])
+        eids = sorted(slot["primer_files"])
+        primers_disp = sorted({slot["display_primers"].get(e, e.split("::")[0]) for e in eids})
         clone_rows.append(
             {
                 "target_id": slot["target_id"],
                 "clone_id": slot["clone_id"],
-                "primers": "|".join(primers),
-                "files": "|".join(slot["primer_files"][p] for p in primers),
+                "primers": "|".join(primers_disp),
+                "files": "|".join(slot["primer_files"][e] for e in eids),
                 **base,
                 "internal_insert_bp": ins.internal_insert_bp,
                 "insert_status": ins.status,
@@ -568,6 +582,7 @@ def main() -> None:
             "clone_id",
             "target_id",
             "primer",
+            "evidence_id",
             "orientation",
             "aligned_len",
             "identity",

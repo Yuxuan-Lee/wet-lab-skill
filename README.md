@@ -56,7 +56,7 @@
 pip install -r toolkit/requirements.txt
 ```
 
-Cursor skill：把本仓库拷到 `~/.cursor/skills/sanger-stage1-seq-matrix/`（或本仓库目录名）。
+Cursor skill：把本仓库拷到 `~/.cursor/skills/sanger-stage1-seq-matrix/`（目录名须与 `SKILL.md` 的 `name` 一致）。
 
 ### 运行
 
