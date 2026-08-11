@@ -1,13 +1,14 @@
 ---
-name: sanger-stage1-seq-matrix
+name: sanger-sequencing-qc
 description: >-
   General two-stage Sanger QC: user-provided target sequences + read assignments
   (any number of primers per clone), stage-1 .seq identity/indel screen, stage-2
-  .ab1 peak purity ≥75%, final target×sample plasmid-return matrix. Use for
-  Sanger review, seq/ab1 QC, multi-primer coverage, or return-plasmid picking.
+  .ab1 peak purity ≥75%, boundary insertion QC, final target×sample plasmid-return
+  matrix. Use for Sanger review, seq/ab1 QC, multi-primer coverage, insertion
+  review, or return-plasmid picking.
 ---
 
-# Sanger Stage-1/2 QC (general)
+# Sanger Sequencing QC
 
 ## What the user must provide
 
